@@ -294,6 +294,159 @@ def scenario_late_events() -> None:
     check("新运行纳入晚报事件", succ_b == succ_a + 5)
 
 
+# ---------------------------------------------------------------- 场景 5
+def scenario_mutex_layers() -> None:
+    banner("场景 5｜互斥层与容量区间：谁能同时影响同一学员、谁必须互斥")
+    print("""  设定：一层 1000 个桶位。实验 A、B 同层互斥（各占一半）；
+  另一层实验 D 与它们共存（共同曝光如实记录，不承诺互不影响）。""")
+
+    layer = post("/layers", {"name": f"demo-layer-{SUFFIX}",
+                             "seed": f"layer-seed-{SUFFIX}", "total_buckets": 1000})
+    lid = layer["id"]
+    print(f"  互斥层 #{lid} 建立，revision=0，总桶位 1000")
+
+    def make_lexp(name: str, rule: dict | None = None) -> int:
+        body = {"name": f"{name}-{SUFFIX}", "seed": f"seed-{name}-{SUFFIX}",
+                "observation_days": 1, "ratios": {"control": 0.5, "treatment": 0.5},
+                "layer_id": lid}
+        if rule:
+            body["audience_rule"] = rule
+        return post("/experiments", body)["id"]
+
+    def slot(eid: int, lo: int, hi: int, rev: int) -> dict:
+        return requests.post(
+            f"{BASE}/layers/{lid}/experiments/{eid}/slot",
+            json={"bucket_from": lo, "bucket_to": hi, "expected_revision": rev},
+            timeout=60).json()
+
+    eid_a, eid_b = make_lexp("demo-layer-a"), make_lexp("demo-layer-b")
+    # 初始留出中间 [300,700) 未分配，便于演示扩流只动用空闲桶位
+    slot(eid_a, 0, 300, 0)
+    slot(eid_b, 700, 1000, 1)
+    detail = get(f"/layers/{lid}")
+    print(f"  A 占 [0,300)、B 占 [700,1000)，当前 revision={detail['revision']}，"
+          f"已用 {detail['capacity']['used']}/1000，空闲 {detail['capacity']['free']}")
+    check("层内区间不重叠且总额成立",
+          detail["capacity"]["used"] == 600 and detail["capacity"]["free"] == 400)
+
+    # 同层互斥：每人至多进一个；未入选原因是 layer_not_selected
+    both_assigned = 0
+    miss_seen = False
+    for i in range(40):
+        key = f"s5-{i:03d}"
+        ra = assign(eid_a, key, f"s5a-req-{i}")
+        rb = assign(eid_b, key, f"s5b-req-{i}")
+        if ra["status"] == "assigned" and rb["status"] == "assigned":
+            both_assigned += 1
+        if rb["status"] == "layer_not_selected" or ra["status"] == "layer_not_selected":
+            miss_seen = True
+    check("同层没有任何学员同时进入两个实验", both_assigned == 0)
+    check("层内未命中单独记录为 layer_not_selected", miss_seen)
+
+    # 决策解释端点
+    sample = get(f"/layers/{lid}/explain", student_key="s5-000")
+    print(f"  explain s5-000：桶位 {sample['bucket']} → 实验 {sample['selected_experiment_id']}")
+    check("解释端点给出桶位与选中实验",
+          isinstance(sample["bucket"], int) and
+          sample["selected_experiment_id"] in (eid_a, eid_b, None))
+
+    # 扩流：A 从 [0,300) 扩大到 [0,500)，只吃空闲桶位，且包含旧区间
+    old_variants = {}
+    for i in range(40):
+        key = f"s5-{i:03d}"
+        r = assign(eid_a, key, f"s5a-req-{i}")
+        if r["status"] == "assigned":
+            old_variants[key] = r["variant"]
+    r = requests.put(f"{BASE}/layers/{lid}/experiments/{eid_a}/capacity",
+                     json={"bucket_from": 0, "bucket_to": 500, "expected_revision": 2},
+                     timeout=60)
+    check("扩流申请成功且 revision 推进", r.status_code == 200 and r.json()["revision"] == 3)
+    # 缩容/平移被拒（新边界不包含旧区间 → 会驱逐老成员）
+    r_bad = requests.put(f"{BASE}/layers/{lid}/experiments/{eid_a}/capacity",
+                         json={"bucket_from": 100, "bucket_to": 500, "expected_revision": 3},
+                         timeout=60)
+    check("会驱逐老成员的边界调整被拒绝", r_bad.status_code == 409)
+    moved = [k for k, v in old_variants.items()
+             if assign(eid_a, k, f"s5a-recheck-{k}")["variant"] != v]
+    check("扩流后老成员一个都不换组", not moved)
+
+    # 两个管理员争抢最后一段空闲 [500,600)：陈旧 revision 直接 409，只有一个修订生效
+    eid_c = make_lexp("demo-layer-c")
+    stale = requests.post(f"{BASE}/layers/{lid}/experiments/{eid_c}/slot",
+                          json={"bucket_from": 500, "bucket_to": 600, "expected_revision": 2},
+                          timeout=60)
+    check("基于旧 revision 的并发申请被拒绝（防超卖）", stale.status_code == 409)
+    fresh = requests.post(f"{BASE}/layers/{lid}/experiments/{eid_c}/slot",
+                          json={"bucket_from": 500, "bucket_to": 600, "expected_revision": 3},
+                          timeout=60)
+    check("读取最新 revision 后申请成功", fresh.status_code == 200)
+
+    # 停招：释放 A 的容量，老成员留观，新来者才能用释放范围
+    old_key = next(iter(old_variants))
+    post(f"/experiments/{eid_a}/stop", {})
+    detail = get(f"/layers/{lid}")
+    stopped = next(x for x in detail["experiments"] if x["experiment_id"] == eid_a)
+    check("停招后区间释放、容量可再分配", stopped["status"] == "stopped")
+    replay = assign(eid_a, old_key, f"s5a-old-{old_key}")
+    check("旧成员停招后仍返回原组完成观察",
+          replay["outcome"] == "duplicate" and replay["variant"] == old_variants[old_key])
+    # 新人再申请已停实验 → stopped 原因
+    newcomer_stop = assign(eid_a, "s5-newcomer-stop", "s5a-new-1")
+    check("新人申请已停实验记录 experiment_stopped",
+          newcomer_stop["status"] == "stopped")
+
+    # 三类原因齐备：受众规则实验挂到 A 释放出的区间
+    rule_exp = make_lexp("demo-layer-rule",
+                         rule={"conditions": [{"field": "age", "op": "gte", "value": 18}]})
+    rev = get(f"/layers/{lid}")["revision"]
+    slot(rule_exp, 0, 100, rev)
+    r_ineligible = None
+    for i in range(300):
+        key = f"s5-young-{i}"
+        r_ineligible = assign(rule_exp, key, f"s5r-req-{i}", profile={"age": 15})
+        if r_ineligible["status"] == "ineligible":
+            break
+    check("受众不合格独立记录为 ineligible",
+          r_ineligible is not None and r_ineligible["reason"] == "audience_rule_not_matched")
+    counts = get(f"/experiments/{eid_a}")["assignment_counts"]
+    check("三类未入组原因各自落库",
+          counts["layer_not_selected"] >= 1 and counts["stopped"] >= 1)
+
+    # 历史重放走当时路由
+    hist = assign(eid_b, "s5-000", "s5b-req-0")
+    check("分配事实冻结当时 route_snapshot", hist["route_snapshot"]["layer"]["revision"] is not None)
+    revisions = get(f"/layers/{lid}/revisions")
+    check("修订历史逐版可查、旧快照不被新边界改写",
+          [r["revision"] for r in revisions] == list(range(len(revisions))))
+
+    # 跨层共存：另一层全量实验 D，与第一层可同时影响同一学员（共同曝光如实记录）
+    layer2 = post("/layers", {"name": f"demo-layer2-{SUFFIX}",
+                              "seed": f"layer2-seed-{SUFFIX}", "total_buckets": 1000})
+    eid_d = post("/experiments", {"name": f"demo-coexist-{SUFFIX}",
+                                  "seed": f"seed-d-{SUFFIX}", "observation_days": 1,
+                                  "ratios": {"control": 0.5, "treatment": 0.5},
+                                  "layer_id": layer2["id"]})["id"]
+    requests.post(f"{BASE}/layers/{layer2['id']}/experiments/{eid_d}/slot",
+                  json={"bucket_from": 0, "bucket_to": 1000, "expected_revision": 0}, timeout=60)
+    # 同一批 s5-* 学员：在第一层（A/B/C）与第二层 D 各有一次曝光
+    for i in range(40):
+        key = f"s5-{i:03d}"
+        assign(eid_d, key, f"s5d-req-{i}")
+        post(f"/experiments/{eid_d}/exposures", {"student_key": key, "status": "success"})
+        rb = assign(eid_b, key, f"s5b-co-{i}")
+        if rb["status"] == "assigned":
+            post(f"/experiments/{eid_b}/exposures", {"student_key": key, "status": "success"})
+    report = get("/reports/co-exposures")
+    pair = next((p for p in report["pairs"] if eid_d in
+                 (p["experiment_a"]["experiment_id"], p["experiment_b"]["experiment_id"])), None)
+    check("跨层碰撞报告按实验对给出共同曝光人数",
+          pair is not None and pair["overlap_students"] >= 1)
+    if pair:
+        print(f"  跨层共同曝光：{pair['overlap_students']} 人，"
+              f"双方曝光成功 {pair['both_exposure_success']} 人；分组组合 {pair['by_variant_pair']}")
+        check("报告明示不支持事后剔除重叠者", "不支持事后剔除" in pair["note"])
+
+
 def main() -> int:
     print(f"目标服务：{BASE}")
     get("/health")
@@ -301,6 +454,7 @@ def main() -> int:
     scenario_observation_waiting()
     scenario_duplicates_and_edges()
     scenario_late_events()
+    scenario_mutex_layers()
 
     banner("总结：如何分清“没有效果”与“现在还不能判断”")
     print("""  · 观察不足 / 上报未齐 / 样本不足 → 系统明说“现在还不能判断”，只报计数。

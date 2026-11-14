@@ -49,8 +49,95 @@ class Experiment(Base):
     enrollment_definition: Mapped[dict] = mapped_column(JSONB, nullable=False)
     observation_days: Mapped[int] = mapped_column(Integer, nullable=False)
     chi2_threshold: Mapped[float] = mapped_column(Float, nullable=False, default=0.001)
+    # 绑定互斥层；为空表示不受层管的独立实验（走单实验分流逻辑）
+    layer_id: Mapped[int | None] = mapped_column(ForeignKey("layers.id"), nullable=True, index=True)
     created_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), nullable=False)
     stopped_at: Mapped["DateTime | None"] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class Layer(Base):
+    """互斥层：同一学员在一层内至多进入一个实验；不同层允许共存（不承诺互不影响）。
+
+    revision 为层路由的乐观锁版本号：每次有效修订（容量申请/停招释放）+1，
+    并发申请以条件更新线性化，只接受一个有效修订。
+    """
+
+    __tablename__ = "layers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    seed: Mapped[str] = mapped_column(String(128), nullable=False)  # 层哈希盐，创建后不可改
+    total_buckets: Mapped[int] = mapped_column(Integer, nullable=False, default=10000)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")  # active
+    created_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class LayerExperiment(Base):
+    """实验在层内占用的容量区间 [bucket_from, bucket_to) 与当前状态。
+
+    扩流只允许向两侧扩大（包含旧区间），新边界不得驱逐已分配学员；
+    停招后状态置 stopped 并释放区间（行保留以追溯），释放范围可被新实验申请。
+    """
+
+    __tablename__ = "layer_experiments"
+    __table_args__ = (
+        UniqueConstraint("layer_id", "experiment_id", name="uq_layer_experiment"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    layer_id: Mapped[int] = mapped_column(ForeignKey("layers.id"), nullable=False, index=True)
+    experiment_id: Mapped[int] = mapped_column(
+        ForeignKey("experiments.id"), nullable=False, unique=True
+    )
+    bucket_from: Mapped[int] = mapped_column(Integer, nullable=False)
+    bucket_to: Mapped[int] = mapped_column(Integer, nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)  # 最近一次区间修订后的层 revision
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="enrolling")  # enrolling | stopped
+    created_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), nullable=False)
+    stopped_at: Mapped["DateTime | None"] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class LayerRevision(Base):
+    """层路由修订历史：每个 revision 冻结当时的全量区间快照。
+
+    历史重放按当时快照解释旧入组，不能用新边界重判；分配事实同时自带 route_snapshot。
+    """
+
+    __tablename__ = "layer_revisions"
+    __table_args__ = (
+        UniqueConstraint("layer_id", "revision", name="uq_layer_revision"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    layer_id: Mapped[int] = mapped_column(ForeignKey("layers.id"), nullable=False, index=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    change_note: Mapped[str] = mapped_column(String(256), nullable=False)
+    snapshot: Mapped[list] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class CoExposure(Base):
+    """跨层共同曝光事实：学员在某层某实验发生曝光回执时落一行（成功/失败均记录）。
+
+    只陈述"同一学员在共存层中分别被曝光"的事实，不承诺层间互不影响；
+    分析侧不提供事后剔除重叠学员的入口（ITT 保持全量）。
+    """
+
+    __tablename__ = "co_exposures"
+    __table_args__ = (
+        UniqueConstraint("student_key", "experiment_id", name="uq_coexposure_student_experiment"),
+        Index("ix_coexposure_student", "student_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    student_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    layer_id: Mapped[int] = mapped_column(ForeignKey("layers.id"), nullable=False, index=True)
+    experiment_id: Mapped[int] = mapped_column(ForeignKey("experiments.id"), nullable=False, index=True)
+    variant: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    exposure_status: Mapped[str] = mapped_column(String(16), nullable=False)  # success | failed
+    recorded_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class RatioConfig(Base):
@@ -99,12 +186,17 @@ class Assignment(Base):
     student_key: Mapped[str] = mapped_column(String(128), nullable=False)
     request_id: Mapped[str] = mapped_column(String(128), nullable=False)
     device_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    status: Mapped[str] = mapped_column(String(16), nullable=False)  # assigned | ineligible | stopped
+    status: Mapped[str] = mapped_column(String(32), nullable=False)  # assigned | ineligible | layer_not_selected | stopped
     variant: Mapped[str | None] = mapped_column(String(16), nullable=True)  # control | treatment
     reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     reason_detail: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     eligibility: Mapped[dict | None] = mapped_column(JSONB, nullable=True)  # 首次申请时的资料与逐条判定
     ratio_config_id: Mapped[int | None] = mapped_column(ForeignKey("ratio_configs.id"), nullable=True)
+    # 分层路由：层、层内桶位、命中时的层 revision 与当时全量路由/实验配置快照
+    layer_id: Mapped[int | None] = mapped_column(ForeignKey("layers.id"), nullable=True, index=True)
+    layer_bucket: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    route_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    route_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     exposure_status: Mapped[str] = mapped_column(String(16), nullable=False, default="unknown")  # unknown | success | failed
     exposure_at: Mapped["DateTime | None"] = mapped_column(DateTime(timezone=True), nullable=True)
     assigned_at: Mapped["DateTime"] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -151,6 +243,9 @@ class AnalysisRun(Base):
     event_seq_snapshot: Mapped[int] = mapped_column(BigInteger, nullable=False)
     watermark_snapshot: Mapped["DateTime | None"] = mapped_column(DateTime(timezone=True), nullable=True)
     ratio_snapshot: Mapped[list] = mapped_column(JSONB, nullable=False)
+    # 运行时预先声明的分层结果快照：实验所属层、层内区间与层 revision；
+    # 分析者只能查看该声明，不能看完效果再剔除跨层重叠学员
+    layer_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")  # running | done
     # 汇总统计（完成时写入）
     diff: Mapped[float | None] = mapped_column(Float, nullable=True)

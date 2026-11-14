@@ -31,6 +31,19 @@ class ExperimentCreateRequest(BaseModel):
     audience_rule: dict | None = Field(default=None, description="受众规则（创建后不可改；变更需新开实验）")
     enrollment_definition: dict | None = Field(default=None, description="报名定义：created_events / revoke_events")
     chi2_threshold: float = Field(default=0.001, gt=0, lt=1, description="分流卡方检查阈值")
+    layer_id: int | None = Field(default=None, description="绑定的互斥层 id；不填则为不受层管的独立实验")
+
+
+class LayerCreateRequest(BaseModel):
+    name: str = Field(description="互斥层名称（唯一）")
+    seed: str = Field(description="层哈希盐，创建后不可改；桶位只取决于种子与学员稳定标识")
+    total_buckets: int = Field(default=10000, ge=100, description="层桶位空间大小（容量计量单位）")
+
+
+class LayerSlotRequest(BaseModel):
+    bucket_from: int = Field(ge=0, description="容量区间起始桶位（含）")
+    bucket_to: int = Field(ge=1, description="容量区间结束桶位（不含）")
+    expected_revision: int = Field(description="乐观锁：客户端读取到的层 revision，不一致返回 409")
 
 
 class RatioChangeRequest(BaseModel):

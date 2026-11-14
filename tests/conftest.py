@@ -30,6 +30,7 @@ def _ensure_test_db() -> None:
 @pytest.fixture(scope="session", autouse=True)
 def _setup_db():
     _ensure_test_db()
+    from app import models  # noqa: F401  确保所有表注册到 Base.metadata
     from app.db import Base, get_engine
 
     Base.metadata.create_all(get_engine())

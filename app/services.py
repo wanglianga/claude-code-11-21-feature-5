@@ -16,23 +16,15 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import clock
+from . import clock, layers
 from .eligibility import evaluate, failed_conditions, validate_rule
+from .errors import DomainError  # 再导出：events/analysis 仍可 from .services import DomainError
 from .models import VARIANTS, Assignment, Experiment, RatioConfig, Student, StudentDevice
 
 DEFAULT_ENROLLMENT_DEFINITION = {
     "created_events": ["order_created"],
     "revoke_events": ["order_canceled", "order_refunded"],
 }
-
-
-class DomainError(Exception):
-    """业务错误，message 面向调用方，status 为 HTTP 状态码。"""
-
-    def __init__(self, message: str, status: int = 400):
-        super().__init__(message)
-        self.message = message
-        self.status = status
 
 
 # ---------------------------------------------------------------- 实验
@@ -61,6 +53,7 @@ def create_experiment(
     audience_rule: dict | None = None,
     enrollment_definition: dict | None = None,
     chi2_threshold: float = 0.001,
+    layer_id: int | None = None,
 ) -> Experiment:
     if not name:
         raise DomainError("name 不能为空")
@@ -70,6 +63,8 @@ def create_experiment(
         raise DomainError("observation_days 必须为 >=1 的整数")
     if not (0 < chi2_threshold < 1):
         raise DomainError("chi2_threshold 必须在 (0,1) 内")
+    if layer_id is not None:
+        layers.get_layer(session, layer_id)  # 层必须存在
     rule = audience_rule or {"conditions": []}
     try:
         validate_rule(rule)
@@ -88,6 +83,7 @@ def create_experiment(
         enrollment_definition=definition,
         observation_days=observation_days,
         chi2_threshold=float(chi2_threshold),
+        layer_id=layer_id,
         created_at=now,
     )
     session.add(exp)
@@ -150,8 +146,13 @@ def stop_experiment(session: Session, experiment_id: int) -> Experiment:
     exp = get_experiment(session, experiment_id)
     if exp.status == "stopped":
         return exp
+    now = clock.now(session)
     exp.status = "stopped"
-    exp.stopped_at = clock.now(session)
+    exp.stopped_at = now
+    # 分层实验：释放层内容量，供新来者使用；老成员分配事实保留，观察继续
+    if exp.layer_id is not None:
+        layer = layers.get_layer(session, exp.layer_id)
+        layers.release_slot(session, layer, exp.id)
     session.commit()
     session.refresh(exp)
     return exp
@@ -225,6 +226,38 @@ def _assignment_payload(a: Assignment, *, outcome: str, idempotent_replay: bool 
         "ratio_config_id": a.ratio_config_id,
         "exposure_status": a.exposure_status,
         "eligibility": a.eligibility,
+        "layer_id": a.layer_id,
+        "layer_bucket": a.layer_bucket,
+        "route_revision": a.route_revision,
+        "route_snapshot": a.route_snapshot,
+    }
+
+
+def _layer_route_snapshot(
+    session: Session, layer, bucket: int, exp: Experiment, rc: RatioConfig | None
+) -> dict:
+    """冻结当时路由与实验配置：历史重放只能用这份快照解释旧入组。"""
+    return {
+        "layer": {
+            "id": layer.id,
+            "name": layer.name,
+            "seed": layer.seed,
+            "total_buckets": layer.total_buckets,
+            "revision": layer.revision,
+        },
+        "bucket": bucket,
+        "routing": layers.route_snapshot(session, layer),
+        "experiment": {
+            "id": exp.id,
+            "name": exp.name,
+            "seed": exp.seed,
+            "status": exp.status,
+            "audience_rule": exp.audience_rule,
+        },
+        "ratio_config": (
+            {"id": rc.id, "effective_from": rc.effective_from.isoformat(), "ratios": rc.ratios}
+            if rc is not None else None
+        ),
     }
 
 
@@ -237,12 +270,12 @@ def request_assignment(
     device_id: str | None = None,
     profile: dict | None = None,
 ) -> dict:
-    """申请分配。返回 outcome ∈ assigned | duplicate | ineligible | stopped。"""
+    """申请分配。返回 outcome ∈ assigned | duplicate | ineligible | layer_not_selected | stopped。"""
     if not request_id:
         raise DomainError("request_id 不能为空（幂等键）")
     exp = get_experiment(session, experiment_id)
 
-    # 1) 幂等键重放：同一 request_id 直接返回首次结果
+    # 1) 幂等键重放：同一 request_id 直接返回首次结果（绑定当时路由的原决定）
     existing = session.scalars(
         select(Assignment).where(
             Assignment.experiment_id == exp.id, Assignment.request_id == request_id
@@ -271,33 +304,104 @@ def request_assignment(
 
     now = clock.now(session)
 
-    # 4) 依次决定首次事实：停招 > 资格不足 > 正常分配（不为凑组数临时接纳不合格者）
+    # 4) 分层实验：先按稳定标识在层内选实验（桶位），再进入该实验分组
+    layer = layers.get_layer(session, exp.layer_id) if exp.layer_id is not None else None
+    bucket = None
+    hit_le = None
+    prior_in_layer = None
+    if layer is not None:
+        bucket, hit_le, _ = layers.select_layer_experiment(session, layer, student.student_key)
+        # 老成员黏性：已在同层其他实验入组（assigned）的学员不是"新来者"，
+        # 停招释放出的范围只服务从未在该层入组的学员；旧成员留在原实验完成观察
+        prior_in_layer = session.scalars(
+            select(Assignment)
+            .join(Experiment, Assignment.experiment_id == Experiment.id)
+            .where(
+                Assignment.student_key == student.student_key,
+                Experiment.layer_id == layer.id,
+                Assignment.status == "assigned",
+                Assignment.experiment_id != exp.id,
+            )
+            .limit(1)
+        ).first()
+
+    # 5) 依次决定首次事实：停招 > 层内未命中 > 资格不足 > 正常分配
     if exp.status != "enrolling":
+        rc = active_ratio_config(session, exp.id, now) if layer is not None else None
         row = Assignment(
             experiment_id=exp.id,
             student_key=student.student_key,
             request_id=request_id,
             device_id=device_id,
             status="stopped",
-            reason="experiment_stopped",
+            reason=layers.REASON_STOPPED,
             reason_detail={"message": "实验已停招，不再接纳新分配；既有观察继续"},
             assigned_at=now,
+            layer_id=layer.id if layer else None,
+            layer_bucket=bucket,
+            route_revision=layer.revision if layer else None,
+            route_snapshot=(
+                _layer_route_snapshot(session, layer, bucket, exp, rc) if layer else None
+            ),
         )
         outcome = "stopped"
+    elif layer is not None and (
+        hit_le is None or hit_le.experiment_id != exp.id or prior_in_layer is not None
+    ):
+        # 层内未命中：桶位未分配给本实验（无实验区间/属同层其他实验），
+        # 或该学员已是同层其他实验的老成员（释放范围仅新来者可用）
+        owner = hit_le.experiment_id if hit_le is not None else None
+        sticky_note = (
+            f"学员已在同层实验 {prior_in_layer.experiment_id} 入组，"
+            "释放/新增容量只对新来者开放，旧成员留在原实验完成观察"
+            if prior_in_layer is not None else None
+        )
+        row = Assignment(
+            experiment_id=exp.id,
+            student_key=student.student_key,
+            request_id=request_id,
+            device_id=device_id,
+            status=layers.STATUS_LAYER_MISS,
+            reason=layers.REASON_LAYER_MISS,
+            reason_detail={
+                "message": "学员桶位未命中本实验的在招容量区间（层内未选中本实验）",
+                "bucket": bucket,
+                "total_buckets": layer.total_buckets,
+                "owner_experiment_id": owner,
+                "sticky_member_of_experiment": (
+                    prior_in_layer.experiment_id if prior_in_layer is not None else None
+                ),
+                "sticky_note": sticky_note,
+                "route_revision": layer.revision,
+            },
+            assigned_at=now,
+            layer_id=layer.id,
+            layer_bucket=bucket,
+            route_revision=layer.revision,
+            route_snapshot=_layer_route_snapshot(session, layer, bucket, exp, None),
+        )
+        outcome = layers.STATUS_LAYER_MISS
     else:
         # 资格：首次申请时按当时资料判定并快照
         evaluation = evaluate(exp.audience_rule, student.profile)
         if not evaluation["eligible"]:
+            rc = active_ratio_config(session, exp.id, now) if layer is not None else None
             row = Assignment(
                 experiment_id=exp.id,
                 student_key=student.student_key,
                 request_id=request_id,
                 device_id=device_id,
                 status="ineligible",
-                reason="audience_rule_not_matched",
+                reason=layers.REASON_AUDIENCE,
                 reason_detail={"failed_conditions": failed_conditions(evaluation)},
                 eligibility=evaluation,
                 assigned_at=now,
+                layer_id=layer.id if layer else None,
+                layer_bucket=bucket,
+                route_revision=layer.revision if layer else None,
+                route_snapshot=(
+                    _layer_route_snapshot(session, layer, bucket, exp, rc) if layer else None
+                ),
             )
             outcome = "ineligible"
         else:
@@ -312,6 +416,12 @@ def request_assignment(
                 eligibility=evaluation,
                 ratio_config_id=rc.id,
                 assigned_at=now,
+                layer_id=layer.id if layer else None,
+                layer_bucket=bucket,
+                route_revision=layer.revision if layer else None,
+                route_snapshot=(
+                    _layer_route_snapshot(session, layer, bucket, exp, rc) if layer else None
+                ),
             )
             outcome = "assigned"
 
@@ -349,5 +459,15 @@ def record_exposure(session: Session, experiment_id: int, *, student_key: str, s
         raise DomainError("该学员在此实验中没有已分配记录", 404)
     a.exposure_status = status
     a.exposure_at = clock.now(session)
+    # 分层实验：登记共同曝光事实（不同层可共存；同层互斥不会出现同学员两条）
+    if a.layer_id is not None:
+        layers.record_co_exposure(
+            session,
+            student_key=a.student_key,
+            layer_id=a.layer_id,
+            experiment_id=exp.id,
+            variant=a.variant,
+            status=status,
+        )
     session.commit()
     return _assignment_payload(a, outcome="assigned")

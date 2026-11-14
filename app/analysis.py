@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
-from . import clock
+from . import clock, layers
 from .events import effective_watermark, max_event_seq
 from .models import (
     VARIANTS,
@@ -99,6 +99,24 @@ def create_run(session: Session, experiment_id: int) -> AnalysisRun:
     exp = get_experiment(session, experiment_id)
     now = clock.now(session)
     configs = list_ratio_configs(session, exp.id)
+    layer_snapshot = None
+    if exp.layer_id is not None:
+        layer = layers.get_layer(session, exp.layer_id)
+        # 预先声明的分层结果：运行一旦创建即冻结，分析者不能看完效果再剔除重叠者
+        layer_snapshot = {
+            "layer": {
+                "id": layer.id,
+                "name": layer.name,
+                "seed": layer.seed,
+                "total_buckets": layer.total_buckets,
+                "revision": layer.revision,
+            },
+            "routing": layers.route_snapshot(session, layer),
+            "declared_note": (
+                "分层/共存关系为运行创建时预先声明的事实；分析按 ITT 全量进行，"
+                "不提供事后剔除跨层重叠学员的入口"
+            ),
+        }
     run = AnalysisRun(
         experiment_id=exp.id,
         cutoff=now,
@@ -108,6 +126,7 @@ def create_run(session: Session, experiment_id: int) -> AnalysisRun:
             {"ratio_config_id": c.id, "effective_from": c.effective_from.isoformat(), "ratios": c.ratios}
             for c in configs
         ],
+        layer_snapshot=layer_snapshot,
         status="running",
         created_at=now,
     )
@@ -373,6 +392,7 @@ def run_result(session: Session, run_id: int) -> dict:
         "event_seq_snapshot": run.event_seq_snapshot,
         "watermark_snapshot": run.watermark_snapshot.isoformat() if run.watermark_snapshot else None,
         "ratio_snapshot": run.ratio_snapshot,
+        "layer_snapshot": run.layer_snapshot,
         "variants": results,
         "effect": {
             "diff": run.diff,
@@ -458,9 +478,14 @@ def student_view(session: Session, experiment_id: int, student_key: str) -> dict
             "ratio_config_id": a.ratio_config_id,
             "exposure_status": a.exposure_status,
             "eligibility": a.eligibility,
+            "layer_id": a.layer_id,
+            "layer_bucket": a.layer_bucket,
+            "route_revision": a.route_revision,
+            "route_snapshot": a.route_snapshot,
         },
         "maturity_now": None,
         "enrollment_basis_now": None,
+        "co_exposures": layers.student_co_exposures(session, student_key) if a.layer_id else None,
         "runs": [],
     }
 

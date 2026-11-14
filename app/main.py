@@ -17,15 +17,17 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import analysis, clock, events as events_svc, services
+from . import analysis, clock, events as events_svc, layers, services
 from .db import Base, get_engine, get_session_factory
-from .models import AnalysisRun, Assignment, Experiment, Source, Student
+from .models import AnalysisRun, Assignment, Experiment, Layer, Source, Student
 from .schemas import (
     AssignmentRequest,
     ClockAdvanceRequest,
     EventIngestRequest,
     ExperimentCreateRequest,
     ExposureRequest,
+    LayerCreateRequest,
+    LayerSlotRequest,
     RatioChangeRequest,
     StudentRegisterRequest,
     WatermarkItem,
@@ -98,6 +100,7 @@ def create_experiment(body: ExperimentCreateRequest, db: Session = Depends(get_d
         audience_rule=body.audience_rule,
         enrollment_definition=body.enrollment_definition,
         chi2_threshold=body.chi2_threshold,
+        layer_id=body.layer_id,
     )
     return experiment_detail(exp.id, db)
 
@@ -111,6 +114,7 @@ def list_experiments(db: Session = Depends(get_db)):
             "name": e.name,
             "status": e.status,
             "observation_days": e.observation_days,
+            "layer_id": e.layer_id,
             "created_at": e.created_at.isoformat(),
         }
         for e in rows
@@ -137,6 +141,7 @@ def experiment_detail(experiment_id: int, db: Session = Depends(get_db)):
         "enrollment_definition": exp.enrollment_definition,
         "observation_days": exp.observation_days,
         "chi2_threshold": exp.chi2_threshold,
+        "layer_id": exp.layer_id,
         "created_at": exp.created_at.isoformat(),
         "stopped_at": exp.stopped_at.isoformat() if exp.stopped_at else None,
         "ratio_configs": [
@@ -146,6 +151,7 @@ def experiment_detail(experiment_id: int, db: Session = Depends(get_db)):
         "assignment_counts": {
             "assigned": counts.get("assigned", 0),
             "ineligible": counts.get("ineligible", 0),
+            "layer_not_selected": counts.get("layer_not_selected", 0),
             "stopped": counts.get("stopped", 0),
         },
     }
@@ -172,6 +178,119 @@ def stop_experiment(experiment_id: int, db: Session = Depends(get_db)):
         "stopped_at": exp.stopped_at.isoformat() if exp.stopped_at else None,
         "note": "停招只停新分配；既有学员的观察与分析继续",
     }
+
+
+# ---------------------------------------------------------------- 互斥层
+
+@app.post("/layers", status_code=201, tags=["layers"])
+def create_layer(body: LayerCreateRequest, db: Session = Depends(get_db)):
+    layer = layers.create_layer(
+        db, name=body.name, seed=body.seed, total_buckets=body.total_buckets
+    )
+    return layers.layer_detail(db, layer)
+
+
+@app.get("/layers", tags=["layers"])
+def list_layers(db: Session = Depends(get_db)):
+    rows = db.scalars(select(Layer).order_by(Layer.id))
+    return [
+        {
+            "id": layer.id,
+            "name": layer.name,
+            "seed": layer.seed,
+            "total_buckets": layer.total_buckets,
+            "revision": layer.revision,
+            "status": layer.status,
+            "created_at": layer.created_at.isoformat(),
+        }
+        for layer in rows
+    ]
+
+
+@app.get("/layers/{layer_id}", tags=["layers"])
+def get_layer(layer_id: int, db: Session = Depends(get_db)):
+    return layers.layer_detail(db, layers.get_layer(db, layer_id))
+
+
+@app.post("/layers/{layer_id}/experiments/{experiment_id}/slot", tags=["layers"])
+def attach_slot(layer_id: int, experiment_id: int, body: LayerSlotRequest,
+                db: Session = Depends(get_db)):
+    """初次申请层内容量区间；expected_revision 做乐观锁，区间重叠/超额返回 409。"""
+    layer = layers.get_layer(db, layer_id)
+    exp = services.get_experiment(db, experiment_id)
+    le = layers.attach_experiment(
+        db, layer, exp,
+        bucket_from=body.bucket_from, bucket_to=body.bucket_to,
+        expected_revision=body.expected_revision,
+    )
+    return _slot_payload(db, layer_id, le)
+
+
+@app.put("/layers/{layer_id}/experiments/{experiment_id}/capacity", tags=["layers"])
+def expand_capacity(layer_id: int, experiment_id: int, body: LayerSlotRequest,
+                    db: Session = Depends(get_db)):
+    """扩流：新区间必须包含旧区间，只占用未分配桶位，不驱逐任何已分配学员。"""
+    layer = layers.get_layer(db, layer_id)
+    le = layers.apply_capacity(
+        db, layer, experiment_id,
+        bucket_from=body.bucket_from, bucket_to=body.bucket_to,
+        expected_revision=body.expected_revision,
+    )
+    return _slot_payload(db, layer_id, le)
+
+
+def _slot_payload(db: Session, layer_id: int, le):
+    return {
+        "layer_id": layer_id,
+        "experiment_id": le.experiment_id,
+        "bucket_from": le.bucket_from,
+        "bucket_to": le.bucket_to,
+        "capacity": le.bucket_to - le.bucket_from,
+        "status": le.status,
+        "revision": le.revision,
+        "layer": layers.layer_detail(db, layers.get_layer(db, layer_id)),
+        "note": "修订已线性化：并发申请只有一个生效，失败方需按新 revision 重新读取剩余容量",
+    }
+
+
+@app.get("/layers/{layer_id}/revisions", tags=["layers"])
+def get_revisions(layer_id: int, db: Session = Depends(get_db)):
+    rows = layers.list_revisions(db, layer_id)
+    return [
+        {
+            "revision": r.revision,
+            "change_note": r.change_note,
+            "created_at": r.created_at.isoformat(),
+            "snapshot": r.snapshot,
+        }
+        for r in rows
+    ]
+
+
+@app.get("/layers/{layer_id}/revisions/{revision}", tags=["layers"])
+def get_revision(layer_id: int, revision: int, db: Session = Depends(get_db)):
+    r = layers.get_revision_snapshot(db, layer_id, revision)
+    return {
+        "layer_id": layer_id,
+        "revision": r.revision,
+        "change_note": r.change_note,
+        "created_at": r.created_at.isoformat(),
+        "snapshot": r.snapshot,
+        "note": "历史重放只能使用当时 revision 的路由解释旧入组，不能用新边界重判",
+    }
+
+
+@app.get("/layers/{layer_id}/explain", tags=["layers"])
+def explain_routing(layer_id: int, student_key: str = Query(...),
+                    db: Session = Depends(get_db)):
+    """解释某学员在当前路由下命中哪个实验或为何未入选（不落库）。"""
+    return layers.explain(db, layer_id, student_key)
+
+
+@app.get("/reports/co-exposures", tags=["layers"])
+def co_exposure_report(db: Session = Depends(get_db)):
+    """跨层碰撞报告：共同分组及曝光人数；只陈述共存事实，不提供事后剔除入口。"""
+    return layers.co_exposure_report(db)
 
 
 # ---------------------------------------------------------------- 学员与分配
